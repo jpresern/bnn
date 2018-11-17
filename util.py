@@ -4,6 +4,7 @@ import io
 import numpy as np
 import tensorflow as tf
 import math
+import sys
 
 def hms(secs):
   if secs < 0:
@@ -22,47 +23,58 @@ def xys_to_bitmap(xys, height, width, rescale=1.0):
   # note: include trailing 1 dim to easier match model output
   bitmap = np.zeros((int(height*rescale), int(width*rescale), 1), dtype=np.float32)
   for x, y in xys:
-    bitmap[int(y*rescale), int(x*rescale), 0] = 1.0  # recall images are (height, width)
+    try:
+      bitmap[int(y*rescale), int(x*rescale), 0] = 1.0  # recall images are (height, width)
+    except IndexError as e:
+      print("IndexError: are --height and --width correct?")
+      raise e
   return bitmap
 
-def debug_img(i, bm, o):
+def debug_img(img, bitmap, logistic_output):
   # create a debug image with three columns; 1) original RGB. 2) black/white
-  # bitmap of labels 3) black/white bitmap of predictions
-  _bs, h, w, _c = bm.shape
+  # bitmap of labels 3) black/white bitmap of predictions (with centroids coloured
+  # red.
+  h, w, _channels = bitmap.shape
   canvas = Image.new('RGB', (w*3, h), (50, 50, 50))
-  i = zero_centered_array_to_pil_image(i[0])
-  i = i.resize((w, h))
-  canvas.paste(i, (0, 0))
-  bm = bitmap_to_pil_image(bm[0])
-  canvas.paste(bm, (w, 0))
-  o = bitmap_to_pil_image(o[0])
-  canvas.paste(o, (w*2, 0))
+  # original input image on left
+  img = zero_centered_array_to_pil_image(img)
+  img = img.resize((w, h))
+  canvas.paste(img, (0, 0))
+  # label bitmap in center
+  canvas.paste(bitmap_to_pil_image(bitmap), (w, 0))
+  # logistic output on right
+  canvas.paste(bitmap_to_pil_image(logistic_output), (w*2, 0))
+  # draw red dots on right hand side image corresponding to
+  # final thresholded prediction
   draw = ImageDraw.Draw(canvas)
+  for y, x in centroids_of_connected_components(logistic_output):
+    draw.rectangle((w*2+x,y,w*2+x,y), fill='red')
+  # finally draw blue lines between the three to delimit boundaries
   draw.line([w,0,w,h], fill='blue')
   draw.line([2*w,0,2*w,h], fill='blue')
   draw.line([3*w,0,3*w,h], fill='blue')
+  # done
   return canvas
 
-def explicit_loss_summary(xent_loss, dice_loss):
-  return tf.Summary(value=[
-    tf.Summary.Value(tag="xent_loss", simple_value=xent_loss),
-    tf.Summary.Value(tag="dice_loss", simple_value=dice_loss)
-  ])
+def explicit_summaries(tag_values):
+  values = [tf.Summary.Value(tag=tag, simple_value=value) for tag, value in tag_values.items()]
+  return tf.Summary(value=values)
 
-def pil_image_to_tf_summary(img):
+def pil_image_to_tf_summary(img, tag="debug_img"):
   # serialise png bytes
   sio = io.BytesIO()
   img.save(sio, format="png")
   png_bytes = sio.getvalue()
 
   # https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/framework/summary.proto
-  return tf.Summary(value=[tf.Summary.Value(tag="debug_img",
+  return tf.Summary(value=[tf.Summary.Value(tag=tag,
                                             image=tf.Summary.Image(height=img.size[0],
                                                                    width=img.size[1],
                                                                    colorspace=3, # RGB
                                                                    encoded_image_string=png_bytes))])
 
 def dice_loss(y, y_hat, batch_size, smoothing=0):
+  # note: not currently used anywhere...
   y = tf.reshape(y, (batch_size, -1))
   y_hat = tf.reshape(y_hat, (batch_size, -1))
   intersection = y * y_hat
@@ -75,6 +87,10 @@ def dice_loss(y, y_hat, batch_size, smoothing=0):
   return loss
 
 def centroids_of_connected_components(bitmap, threshold=0.05, rescale=1.0):
+  # TODO: don't do raw (binary) threshold; instead use P(y) as weighting for centroid
+  #       e.g. https://arxiv.org/abs/1806.03413 sec 3.D
+  # TODO: hunt down the x/y swap between PIL and label db :/
+
   # threshold
   mask = bitmap > threshold
   bitmap = np.zeros_like(bitmap)
@@ -148,46 +164,88 @@ def red_dots(rgb, centroids):
     canvas.rectangle((x-2,y-2,x+2,y+2), fill='red')
   return img
 
-def compare_sets(true_pts, predicted_pts):
-  # compare two sets of points (presumably true & predicted centroids)
-  # iteratively find closest point in each set and accumulative distance
-  # at end add arbitrary penalty for each point left in either set (e.g. sets
-  # not same size). normalise final value by size of originl true set
 
-  # record true set size for final normalisation
-  original_num_true_pts = len(true_pts)
+class SetComparison(object):
+  def __init__(self):
+    self.true_positive_count = 0
+    self.false_negative_count = 0
+    self.false_positive_count = 0
 
-  # still a problem somewhere were centroid x/ys are being flipped :/
-  # need to hunt this DOWN!!! (see flip=True)
-  predicted_pts = [(y, x) for x, y in predicted_pts]
+  def compare_sets(self, true_pts, predicted_pts, threshold=10.0):
+    # compare two sets of true & predicted centroids and calculate TP, FP and FN rate.
 
-  # since we're going to be mutating these lists (by removing points)
-  # let's explicitly record idxs alongside
-  # note: removal of points was the main idea to not use a 2d np array here
-  true_pts = list(enumerate(true_pts))
-  predicted_pts = list(enumerate(predicted_pts))
+    # iteratively find closest point in each set and if they are close enough (according
+    # to threshold) declare them them a match (i.e. true positive). once the closest
+    # match is above the threshold, or we run out of points to match, stop comparing.
+    # whatever remains in true_pts & predicted_pts after matching is done are false
+    # negatives & positives respectively.
+    TP = 0
+    while len(true_pts) > 0 and len(predicted_pts) > 0:
+      # find indexes of closest pair
+      closest_pair = None
+      closest_sqr_distance = None
+      for t_i, t in enumerate(true_pts):
+        for p_i, p in enumerate(predicted_pts):
+          sqr_distance = (t[0]-p[0])**2 + (t[1]-p[1])**2
+          if closest_sqr_distance is None or sqr_distance < closest_sqr_distance:
+            closest_pair = t_i, p_i
+            closest_sqr_distance = sqr_distance
+      # if closest pair is above threshold so comparing
+      closest_distance = math.sqrt(closest_sqr_distance)
+      if closest_distance > threshold:
+        break
+      # otherwise delete closest pair & declare them a match
+      t_i, p_i = closest_pair
+      del true_pts[t_i]
+      del predicted_pts[p_i]
+      TP += 1
 
-  # iterate through pairs collecting sum of (sqrd) distances
-  # between closest points until one of the lists is empty
-  cumulative_distance = 0.0
-  while len(true_pts) > 0 and len(predicted_pts) > 0:
-    # find indexes of closest pair
-    closest_pair = None
-    closest_distance = None  # though, actually squared distance
-    for t_i, (_, t) in enumerate(true_pts):
-      for p_i, (_, p) in enumerate(predicted_pts):
-        distance = (t[0]-p[0])**2 + (t[1]-p[1])**2
-        if closest_distance is None or distance < closest_distance:
-          closest_pair = t_i, p_i
-          closest_distance = distance
-    # collect distance and delete points
-    cumulative_distance += math.sqrt(closest_distance)
-    t_i, p_i = closest_pair
-    del true_pts[t_i]
-    del predicted_pts[p_i]
+    # remaining unmatched entries are false positives & negatives.
+    FN = len(true_pts)
+    FP = len(predicted_pts)
 
-  # penalise each missing pair by a distance of (arbitrary) 100
-  cumulative_distance += 100 * (len(true_pts) + len(predicted_pts))
+    # aggregate
+    self.true_positive_count += TP
+    self.false_negative_count += FN
+    self.false_positive_count += FP
 
-  # normalise final return value by original number of true labels
-  return cumulative_distance / original_num_true_pts
+    # return for just this comparison
+    return TP, FN, FP
+
+  def precision_recall_f1(self):
+    try:
+      precision = self.true_positive_count / (self.true_positive_count + self.false_positive_count)
+      recall = self.true_positive_count / (self.true_positive_count + self.false_negative_count)
+      f1 = 2 * (precision * recall) / (precision + recall)
+      return precision, recall, f1
+    except ZeroDivisionError:
+      return 0, 0, 0
+
+def check_images(fnames):
+  prev_width, prev_height = 0, 0
+  for i, fname in enumerate(fnames):
+    try:
+      im = Image.open(fname)
+    except IOError as e:
+      print("Image is corrupted or does not exist:", fname)
+      raise e
+      # sys.exit()
+
+    width, height = im.size
+    if i == 0:
+      prev_width = width
+      prev_height = height
+    elif not prev_width == width or not prev_height == height:
+      print("Image size does not match others:", fname, "wh:", width, height)
+      exit()
+  return width, height
+
+def shuffled_endless_generator(l):
+  l_copy = l.copy()
+  while True:
+    random.shuffle(l_copy)
+    for element in l_copy:
+      yield element
+
+def n_tiles(v, n=10):
+  return np.percentile(v, np.linspace(0, 100, n+1))

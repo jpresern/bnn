@@ -22,6 +22,11 @@ class LabelDB(object):
         # assume table already exists? clumsy...
         pass
 
+  def has_been_created(self):
+    c = self.conn.cursor()
+    c.execute("select name from sqlite_master where type='table' AND name='imgs';")
+    return c.fetchone() is not None
+
   def imgs(self):
     c = self.conn.cursor()
     c.execute("select filename from imgs")
@@ -86,5 +91,4 @@ if __name__ == "__main__":
   parser.add_argument('--label-db', type=str, default="label.db")
   opts = parser.parse_args()
   db = LabelDB(label_db_file=opts.label_db)
-#  db.create_if_required()
-  print("#entries", len(db.imgs()))
+  print("\n".join(db.imgs()))
